@@ -23,7 +23,8 @@
 ## Features
 
 * 🚀 **Zero External Dependencies**: Pure LuaJIT FFI implementation connecting directly to Windows Named Pipes (`\\.\pipe\discord-ipc-*`). No Python, Node.js, C DLLs, or external `.exe` companion daemons required.
-* 🎨 **Dual-Engine Anime Cover Art**: Automatically cleans release group tags, video parameters, and season numbers, then asynchronously fetches official high-res key visual posters from **Bangumi (bgm.tv)** with **AniList (anilist.co)** fallback.
+* 🎨 **Dual-Engine Anime Cover Art**: Automatically cleans release group tags, video parameters, and season numbers, then asynchronously fetches key visual posters from **Bangumi (bgm.tv)** with **AniList (anilist.co)** fallback.
+* 🔎 **Traditional Chinese Search Fallback**: Searches the original keyword first. If it has no usable Bangumi result, Windows NLS converts a copy to Simplified Chinese and retries before AniList. For example, `學生會也有洞！` retries as `学生会也有洞！`. Filenames and display-title preferences are not converted.
 * 🌐 **Bilingual (English & Chinese)**: Full internationalization support with configurable original Japanese names (e.g. `ヤニねこ`) or localized translated names (e.g. `抽烟猫`).
 * ⏱️ **De-duplicated Progress**: Removes redundant total duration text during playback to perfectly match Discord's native media player progress bar; retains precise timestamps when paused.
 * ⌨️ **Hotkeys & On-the-Fly Toggle**: Easily toggle Rich Presence on or off at any time using `Ctrl+d` with on-screen OSD notifications.
@@ -83,6 +84,28 @@ portable_config/
 1. 下载本仓库压缩包或克隆代码。
 2. 将 `scripts/anime_presence.lua` 和 `script-opts/anime_presence.conf` 复制到你的 mpv 配置目录（如 `portable_config` 或 `AppData\roaming\mpv`）中对应的子文件夹下。
 3. 打开 mpv 播放动漫即可自动生效！
+
+### 繁体片名检索
+
+先以清洗后的原词查询 Bangumi；未命中时，使用 Windows 自带的 NLS 接口将**搜索词副本**转为简体再查询，最后才回退到 AniList。例如：`學生會也有洞！` → `学生会也有洞！`。不会修改本地文件名，也不会改变 `original` / `translated` 显示偏好。日文先按原词查询，原词已命中时不执行转换查询。
+
+> Poster searches use Windows' bundled `curl.exe` asynchronously; no companion daemon or extra Python/Node runtime is required. Only cleaned search keywords are sent to the catalogue APIs.
+>
+> 海报检索会异步调用 Windows 自带的 `curl.exe`，无需手动启动辅助程序或安装 Python/Node；只向资料库发送清洗后的搜索关键词。
+
+## Tests
+
+Run from the repository root on Windows with a LuaJIT-enabled mpv. These tests do not publish any Discord activity:
+
+```powershell
+# Offline regression tests (23 assertions, including native Chinese conversion)
+mpv --no-config --load-scripts=no --idle=yes --script=tests/traditional-search.lua
+
+# Also verify the user's Traditional Chinese example against the live Bangumi API
+mpv --no-config --load-scripts=no --idle=yes --script=tests/traditional-search.lua --script-opts=traditional_search_tests-live=yes
+```
+
+Live checks depend on network availability and current catalogue results. First-result matching does not guarantee the correct season for every filename.
 
 ---
 

@@ -63,6 +63,9 @@ int __stdcall ReadFile(void *, void *, unsigned long, unsigned long *, void *);
 int __stdcall WriteFile(void *, const void *, unsigned long, unsigned long *, void *);
 int __stdcall CloseHandle(void *);
 unsigned long __stdcall GetLastError(void);
+int __stdcall MultiByteToWideChar(unsigned int, unsigned long, const char *, int, wchar_t *, int);
+int __stdcall WideCharToMultiByte(unsigned int, unsigned long, const wchar_t *, int, char *, int, const char *, int *);
+int __stdcall LCMapStringEx(const wchar_t *, unsigned long, const wchar_t *, int, wchar_t *, int, void *, void *, intptr_t);
 ]]
 local win = ffi.load('kernel32')
 local INVALID_HANDLE = ffi.cast('void *', -1)
@@ -70,6 +73,7 @@ local handle, ready, rx, pending = nil, false, '', {}
 local enabled, file_loaded, sent_active = o.enabled, false, false
 local retry_at, handshake_at, last_sent = 0, 0, -100
 local current_cover_url, current_cover_title = nil, nil
+local cover_generation = 0 -- stale asynchronous lookups must not change a newer file's cover
 local cover_cache = {}
 local activity_writes = {} -- rolling window; reserve one of five slots for clearing
 local dirty, sequence, stopped = true, 0, false
@@ -296,7 +300,38 @@ local function url_encode(str)
         return string.format('%%%02X', string.byte(c))
     end)
 end
-local function fetch_anilist(query)
+-- Convert search keywords only. Keep filenames, metadata and display-title preferences intact.
+-- Windows NLS is already available on supported systems; no bundled character table or helper.
+local function simplified_search_title(text)
+    if type(text) ~= 'string' or text == '' then return text end
+    local success, converted = pcall(function()
+        local length = win.MultiByteToWideChar(65001, 8, text, #text, nil, 0)
+        if length <= 0 then return text end
+        local wide = ffi.new('wchar_t[?]', length)
+        if win.MultiByteToWideChar(65001, 8, text, #text, wide, length) ~= length then return text end
+        local locale = ffi.new('wchar_t[1]', 0) -- invariant locale
+        local count = win.LCMapStringEx(locale, 0x02000000, wide, length, nil, 0, nil, nil, 0)
+        if count <= 0 then return text end
+        local mapped = ffi.new('wchar_t[?]', count)
+        if win.LCMapStringEx(locale, 0x02000000, wide, length, mapped, count, nil, nil, 0) ~= count then return text end
+        local bytes = win.WideCharToMultiByte(65001, 0, mapped, count, nil, 0, nil, nil)
+        if bytes <= 0 then return text end
+        local utf8 = ffi.new('char[?]', bytes)
+        if win.WideCharToMultiByte(65001, 0, mapped, count, utf8, bytes, nil, nil) ~= bytes then return text end
+        return ffi.string(utf8, bytes)
+    end)
+    return success and converted or text
+end
+local function apply_cover(entry, generation)
+    if generation ~= cover_generation then return end
+    current_cover_url = entry.url
+    current_cover_title = entry.translated
+    if o.title_preference == 'original' or o.title_preference == 'native' or o.title_preference == 'jp' then
+        current_cover_title = entry.original
+    end
+    dirty = true
+end
+local function fetch_anilist(query, generation)
     local body = utils.format_json({
         query = 'query ($s: String) { Media(search: $s, type: ANIME) { id title { romaji english native } coverImage { extraLarge large } } }',
         variables = { s = query }
@@ -313,8 +348,9 @@ local function fetch_anilist(query)
             'https://graphql.anilist.co'
         }
     }, function(success, res, err)
+        if generation ~= cover_generation then return end
         if not success or not res or res.status ~= 0 or not res.stdout then
-            cover_cache[query] = false
+            -- A transient network error should be retried on the next file, not cached forever.
             return
         end
         local data = utils.parse_json(res.stdout)
@@ -325,9 +361,7 @@ local function fetch_anilist(query)
             local trans_name = (media.title and media.title.romaji and media.title.romaji ~= '') and media.title.romaji or orig_name
             local chosen_name = (o.title_preference == 'original' or o.title_preference == 'native' or o.title_preference == 'jp') and orig_name or trans_name
             cover_cache[query] = { url = img, original = orig_name, translated = trans_name, title = chosen_name }
-            current_cover_url = img
-            current_cover_title = chosen_name
-            dirty = true
+            apply_cover(cover_cache[query], generation)
             log('AniList cover fallback loaded: ' .. tostring(chosen_name) .. ' -> ' .. img)
             return
         end
@@ -336,60 +370,50 @@ local function fetch_anilist(query)
 end
 local function fetch_cover(query)
     if not o.cover_art or not query or query == '' then return end
+    local generation = cover_generation
     if cover_cache[query] ~= nil then
-        if cover_cache[query] then
-            local entry = cover_cache[query]
-            local chosen_name = entry.translated
-            if o.title_preference == 'original' or o.title_preference == 'native' or o.title_preference == 'jp' then
-                chosen_name = entry.original
-            end
-            current_cover_url = entry.url
-            current_cover_title = chosen_name
-            dirty = true
-        end
+        if cover_cache[query] then apply_cover(cover_cache[query], generation) end
         return
     end
-
-    local enc = url_encode(query)
-    local url = 'https://api.bgm.tv/search/subject/' .. enc .. '?type=2'
-
-    mp.command_native_async({
-        name = 'subprocess',
-        playback_only = false,
-        capture_stdout = true,
-        args = {
-            'curl.exe', '-s', '-L', '-m', '6',
-            '-H', 'User-Agent: mpv-discord-presence/1.0',
-            url
-        }
-    }, function(success, res, err)
-        if not success or not res or res.status ~= 0 or not res.stdout then
-            fetch_anilist(query)
+    -- Search the exact title first: Chinese conversion can alter Japanese kanji.
+    -- Retry the simplified keyword only when the original lookup has no usable result.
+    local candidates = {query}
+    local simplified = simplified_search_title(query)
+    if simplified ~= query and simplified ~= '' then candidates[#candidates+1] = simplified end
+    local function search(index)
+        if generation ~= cover_generation then return end
+        local keyword = candidates[index]
+        if not keyword then fetch_anilist(query, generation); return end
+        local cached = cover_cache[keyword]
+        if cached then
+            cover_cache[query] = cached
+            apply_cover(cached, generation)
             return
         end
-        local data = utils.parse_json(res.stdout)
-        if data and data.list and #data.list > 0 then
-            local first = data.list[1]
-            local img = first.images and (first.images.large or first.images.common)
-            if img then
-                img = img:gsub('^http://', 'https://')
-                local orig_name = (first.name and first.name ~= '') and first.name or first.name_cn
-                local trans_name = (first.name_cn and first.name_cn ~= '') and first.name_cn or first.name
-                local chosen_name = trans_name
-                if o.title_preference == 'original' or o.title_preference == 'native' or o.title_preference == 'jp' then
-                    chosen_name = orig_name
-                end
-                cover_cache[query] = { url = img, original = orig_name, translated = trans_name, title = chosen_name }
-                current_cover_url = img
-                current_cover_title = chosen_name
-                dirty = true
-                log('Bangumi cover loaded: ' .. tostring(chosen_name) .. ' -> ' .. img)
+        local url = 'https://api.bgm.tv/search/subject/' .. url_encode(keyword) .. '?type=2'
+        mp.command_native_async({
+            name = 'subprocess', playback_only = false, capture_stdout = true,
+            args = {'curl.exe', '-f', '-sS', '-L', '--connect-timeout', '3', '-m', '6',
+                '-H', 'User-Agent: mpv-anime-presence/1.0', url}
+        }, function(success, res, err)
+            if generation ~= cover_generation then return end
+            local data = success and res and res.status == 0 and utils.parse_json(res.stdout or '')
+            local first = type(data) == 'table' and type(data.list) == 'table' and data.list[1]
+            local img = type(first) == 'table' and type(first.images) == 'table'
+                and (first.images.large or first.images.common)
+            if type(img) == 'string' and img ~= '' then
+                local original = (first.name and first.name ~= '') and first.name or first.name_cn
+                local translated = (first.name_cn and first.name_cn ~= '') and first.name_cn or first.name
+                local entry = {url=img:gsub('^http://', 'https://'), original=original, translated=translated}
+                cover_cache[query], cover_cache[keyword] = entry, entry
+                apply_cover(entry, generation)
+                log('Bangumi cover loaded: ' .. tostring(current_cover_title) .. ' -> ' .. entry.url)
                 return
             end
-        end
-        -- Bangumi returned 0 results; fallback to AniList
-        fetch_anilist(query)
-    end)
+            search(index+1)
+        end)
+    end
+    search(1)
 end
 local function clock(n)
     n = math.max(0, math.floor(n or 0))
@@ -480,6 +504,7 @@ end
 mp.register_script_message('toggle-discord-presence', toggle)
 mp.add_key_binding(o.key, 'toggle-discord-presence', toggle)
 mp.register_event('file-loaded', function()
+    cover_generation = cover_generation + 1
     file_loaded, dirty = true, true
     current_cover_url = nil
     current_cover_title = nil
@@ -492,6 +517,7 @@ mp.register_event('file-loaded', function()
     safe_tick()
 end)
 mp.register_event('end-file', function()
+    cover_generation = cover_generation + 1
     file_loaded = false
     current_cover_url = nil
     current_cover_title = nil
