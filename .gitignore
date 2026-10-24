@@ -1,0 +1,18 @@
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+# Editor artifacts
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# mpv logs & cache
+*.log
+_cache/
+saved-props.json
